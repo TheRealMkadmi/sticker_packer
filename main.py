@@ -286,6 +286,58 @@ def skyline_pack(candidates: List[ImageInfo],
     
     return placements
 
+def opportunistic_pack(candidates: List[ImageInfo],
+                         placements: List[Placement],
+                         page_width: float,
+                         page_height: float,
+                         pad: float,
+                         debug: bool = False) -> List[Placement]:
+    """
+    Opportunistically pack additional (typically smaller) images into free spaces.
+    Seed positions are gathered from the corners of existing placements.
+    Candidates are tried in ascending order of area.
+    """
+    new_placements: List[Placement] = []
+    # Gather unique seed points from existing placements
+    seeds = {(p.x, p.y) for p in placements}
+    for p in placements:
+        for corner in p.get_corners():
+            seeds.add(corner)
+    # Convert to a sorted list (by x then y)
+    seed_list = sorted(seeds, key=lambda s: (s[0], s[1]))
+    # Process candidates from smallest area upwards
+    sorted_candidates = sorted(candidates, key=lambda c: c.get_area())
+    
+    for sx, sy in seed_list:
+        for cand_idx, candidate in enumerate(sorted_candidates):
+            for img_w, img_h, rotation in candidate.get_rotations(pad):
+                # Check boundaries
+                if sx + img_w > page_width or sy + img_h > page_height:
+                    continue
+                # Check collision with existing placements
+                if check_placement_collision(sx, sy, img_w, img_h, placements + new_placements, debug):
+                    continue
+                # Found a valid placement; add it
+                new_p = Placement(
+                    img_idx=cand_idx,
+                    img=candidate.img,
+                    x=sx,
+                    y=sy,
+                    width=img_w,
+                    height=img_h,
+                    rotation=rotation
+                )
+                new_placements.append(new_p)
+                if debug:
+                    logger.debug(f"Opportunistic placement at ({sx:.2f},{sy:.2f}) with size {img_w:.2f}x{img_h:.2f} and rot {rotation}")
+                # Proceed to next seed after a successful placement
+                break
+            else:
+                continue
+            break
+
+    return new_placements
+
 # --- Main Routine ---
 def main():
     # Default parameters (in centimeters)
@@ -306,14 +358,14 @@ def main():
     parser.add_argument("--max_image_cm", type=float, default=default_max_image_cm,
                         help=f"Maximum image dimension in cm (default: {default_max_image_cm} cm)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--debug_level", type=str, choices=["INFO", "DEBUG"], default="INFO",
+    parser.add_argument("--log_level", type=str, choices=["INFO", "DEBUG"], default="INFO",
                         help="Debug logging level (INFO or DEBUG)")
     
     args = parser.parse_args()
 
     # Configure logger based on debug level argument
     logger.remove()
-    log_level = args.debug_level
+    log_level = args.log_level
     logger.add(sys.stderr, level=log_level)
     logger.info(f"Log level set to {log_level}")
 
@@ -354,6 +406,10 @@ def main():
     if not placements:
         logger.error("Unable to pack any images on the page with the given dimensions.")
         sys.exit(1)
+    
+    # Opportunistic second pass to fill free spaces with smaller images.
+    opportunistic = opportunistic_pack(candidates, placements, page_width_pt, page_height_pt, pad_pt, debug=debug_mode)
+    placements.extend(opportunistic)
     
     # Generate PDF with support for rotated images
     try:

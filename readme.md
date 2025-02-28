@@ -4,7 +4,7 @@
 Who doesn't love stickers? This is a simple sticker packer that takes a directory of images and packs them into a single pdf file.
 
 ## Why? 
-Printing stickers is expensive. This is a simple way to minimize the cost of printing stickers.
+Printing stickers is expensive. This is a simple way to minimize the cost of printing stickers. This would benefit greatly from a rewrite in a more performant language, but it works for now.
 
 ## How to use
 1. Clone the repository
