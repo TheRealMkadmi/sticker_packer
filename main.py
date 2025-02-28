@@ -135,74 +135,155 @@ def process_image(image_path: str, max_pixels: int):
         return None
 
 # NEW: Maximal-Rectangles Packing Algorithm for Rectangular Images
-def pack_rectangles(candidates: List[ImageInfo],
-                    bin_width: float,
-                    bin_height: float,
-                    pad: float) -> List[Placement]:
+def check_placement_collision(new_x, new_y, new_w, new_h, placements, debug=False) -> bool:
+    """Check if a new placement would overlap with any existing placements."""
+    epsilon = 1e-3  # small tolerance for floating point comparisons
+    for i, p in enumerate(placements):
+        if not (
+            new_x + new_w <= p.x + epsilon or p.x + p.width <= new_x + epsilon or
+            new_y + new_h <= p.y + epsilon or p.y + p.height <= new_y + epsilon
+        ):
+            if debug:
+                logger.debug(f"Collision detected: New({new_x:.2f},{new_y:.2f},{new_w:.2f},{new_h:.2f}) "
+                            f"with existing placement {i}: ({p.x:.2f},{p.y:.2f},{p.width:.2f},{p.height:.2f})")
+            return True
+    return False
+
+def skyline_pack(candidates: List[ImageInfo],
+                 bin_width: float,
+                 bin_height: float,
+                 pad: float,
+                 debug: bool = False) -> List[Placement]:
     """
-    Pack images using a maximal-rectangles algorithm.
-    Iteratively choose the candidate (with 0° and 90° rotations) that best fits into one of the free rectangles,
-    then update the free space by splitting the used free rectangle.
+    Pack images using a skyline-based algorithm to minimize wasted space.
+    This algorithm maintains a skyline (lowest y-value at each x-position) and places
+    images at locations that minimize the waste above the skyline.
     """
     # Track usage count for each candidate
     usage_count = [0] * len(candidates)
-    free_rects: List[Tuple[float, float, float, float]] = [(0, 0, bin_width, bin_height)]
     placements: List[Placement] = []
-
-    def remove_overlaps(rects: List[Tuple[float, float, float, float]]) -> List[Tuple[float, float, float, float]]:
-        # Merge or remove overlapping free rectangles
-        # (Implementation to remove overlaps or merge rectangles)
-        return rects
-
+    
+    # Initialize skyline as a flat line at y=0
+    skyline = [(0, 0, bin_width)]  # (x, y, width)
+    
+    if debug:
+        logger.debug(f"Starting skyline packing. Bin: {bin_width:.2f}x{bin_height:.2f}, Candidates: {len(candidates)}")
+    
     while True:
         best_score = float('inf')
-        best_info = None  # (free_idx, candidate_idx, rotation, rect_x, rect_y, cand_w, cand_h)
-        # Iterate over all free rectangles, candidates, and rotations
-        for free_idx, (fx, fy, fw, fh) in enumerate(free_rects):
-            for candidate_idx, candidate in enumerate(candidates):
-                for cand_w, cand_h, rotation in candidate.get_rotations(pad):
-                    # Check if candidate fits in free rectangle
-                    if cand_w <= fw and cand_h <= fh:
-                        # Heuristic: choose placement with minimal short side leftover
-                        leftover_w = fw - cand_w
-                        leftover_h = fh - cand_h
-                        # Add usage penalty to the score
-                        score = min(leftover_w, leftover_h) + usage_count[candidate_idx] * 100.0
-                        if score < best_score:
-                            best_score = score
-                            best_info = (free_idx, candidate_idx, rotation, fx, fy, cand_w, cand_h)
-        if best_info is None:
+        best_placement = None
+        best_skyline_idx = -1
+        
+        # Find best placement location along skyline
+        for sky_idx, (sky_x, sky_y, sky_width) in enumerate(skyline):
+            # Skip if segment is too narrow
+            if sky_width < 1:
+                continue
+                
+            for cand_idx, candidate in enumerate(candidates):
+                # Penalize repeated use of the same image with exponential penalty
+                penalty = usage_count[cand_idx] ** 2 * 100.0
+                
+                for img_w, img_h, rotation in candidate.get_rotations(pad):
+                    # Skip if image doesn't fit horizontally in skyline segment
+                    if img_w > sky_width:
+                        continue
+                        
+                    # Skip if image doesn't fit vertically in bin
+                    if sky_y + img_h > bin_height:
+                        continue
+                    
+                    # Check for collisions with existing placements
+                    if check_placement_collision(sky_x, sky_y, img_w, img_h, placements, debug):
+                        continue
+                    
+                    # Calculate wasted space score - prioritize placements that fit well
+                    waste_score = 0
+                    
+                    # Calculate how well this image fits into current skyline segment
+                    # Lower is better
+                    fit_width = min(img_w, sky_width)
+                    waste_width = abs(sky_width - fit_width)
+                    waste_score += waste_width * 0.5
+                    
+                    # Give better score to images that fit perfectly or close to perfectly
+                    waste_score += abs(img_w - sky_width) * 0.2
+                    
+                    # Add penalty to avoid same image repeatedly
+                    # Add a small random factor to encourage uniform distribution
+                    total_score = waste_score + penalty + random.uniform(0, 5)
+                    
+                    if debug and cand_idx == 0:  # Only debug first candidate to avoid log spam
+                        logger.debug(f"Considering: cand={cand_idx}, rot={rotation}, "
+                                    f"pos=({sky_x:.2f},{sky_y:.2f}), "
+                                    f"size={img_w:.2f}x{img_h:.2f}, score={total_score:.2f}")
+                    
+                    if total_score < best_score:
+                        best_score = total_score
+                        best_placement = (cand_idx, sky_x, sky_y, img_w, img_h, rotation)
+                        best_skyline_idx = sky_idx
+        
+        # No valid placement found, we're done
+        if best_placement is None:
+            if debug:
+                logger.debug("No more valid placements found. Packing complete.")
             break
-
-        free_idx, candidate_idx, rotation, px, py, cand_w, cand_h = best_info
-        usage_count[candidate_idx] += 1  # Increase usage for chosen candidate
-        # Record the placement at the free rectangle's top-left corner (maintaining padding in dimensions)
+            
+        # Place the best candidate
+        cand_idx, px, py, width, height, rotation = best_placement
+        usage_count[cand_idx] += 1
+        
+        # Add placement to results
         placement = Placement(
-            img_idx=candidate_idx,
-            img=candidates[candidate_idx].img,
+            img_idx=cand_idx,
+            img=candidates[cand_idx].img,
             x=px,
             y=py,
-            width=cand_w,
-            height=cand_h,
+            width=width,
+            height=height,
             rotation=rotation
         )
         placements.append(placement)
-        # Remove the free rectangle used
-        used_rect = free_rects.pop(free_idx)
-
-        # Split the used free rectangle into up to two new free rectangles.
-        # Placed rectangle occupies (px, py, cand_w, cand_h).
-        new_rects = []
-        # Right split: area to the right of the placed rectangle.
-        if used_rect[0] + used_rect[2] - (px + cand_w) > 0:
-            new_rects.append((px + cand_w, py, used_rect[0] + used_rect[2] - (px + cand_w), cand_h))
-        # Top split: area above the placed rectangle.
-        if used_rect[3] - cand_h > 0:
-            new_rects.append((px, py + cand_h, used_rect[2], used_rect[3] - cand_h))
-        # Add the new free rectangles back
-        free_rects.extend(new_rects)
-        free_rects = remove_overlaps(free_rects)
-
+        
+        if debug:
+            logger.debug(f"Placed image {cand_idx} at ({px:.2f},{py:.2f}), "
+                       f"size={width:.2f}x{height:.2f}, rotation={rotation}")
+        
+        # Update skyline
+        # Remove the used segment
+        used_segment = skyline.pop(best_skyline_idx)
+        sky_x, sky_y, sky_width = used_segment
+        
+        # If we used only part of the segment width, add back the remaining part
+        if px + width < sky_x + sky_width:
+            remain_x = px + width
+            remain_width = sky_x + sky_width - remain_x
+            skyline.insert(best_skyline_idx, (remain_x, sky_y, remain_width))
+        
+        # Add the new elevated segment
+        new_segment = (px, py + height, width)
+        skyline.insert(best_skyline_idx, new_segment)
+        
+        # Merge adjacent segments with the same height
+        merged_skyline = []
+        i = 0
+        while i < len(skyline):
+            seg_x, seg_y, seg_w = skyline[i]
+            # Look ahead to combine adjacent segments at the same height
+            while i + 1 < len(skyline) and abs(skyline[i][1] - skyline[i+1][1]) < 0.001 and skyline[i][0] + skyline[i][2] >= skyline[i+1][0]:
+                next_x, next_y, next_w = skyline[i+1]
+                # Extend current segment
+                seg_w = max(seg_w, next_x + next_w - seg_x)
+                i += 1
+            merged_skyline.append((seg_x, seg_y, seg_w))
+            i += 1
+            
+        skyline = merged_skyline
+        skyline.sort(key=lambda s: s[0])  # Sort by x coordinate
+        
+        if debug:
+            logger.debug(f"Updated skyline: {skyline}")
+    
     return placements
 
 # --- Main Routine ---
@@ -225,12 +306,14 @@ def main():
     parser.add_argument("--max_image_cm", type=float, default=default_max_image_cm,
                         help=f"Maximum image dimension in cm (default: {default_max_image_cm} cm)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--debug_level", type=str, choices=["INFO", "DEBUG"], default="INFO",
+                        help="Debug logging level (INFO or DEBUG)")
     
     args = parser.parse_args()
 
-    # Configure logger based on debug flag
+    # Configure logger based on debug level argument
     logger.remove()
-    log_level = "DEBUG" if args.debug else "INFO"
+    log_level = args.debug_level
     logger.add(sys.stderr, level=log_level)
     logger.info(f"Log level set to {log_level}")
 
@@ -265,8 +348,9 @@ def main():
     # Sort candidates by area (largest first) for better initial packing
     candidates.sort(key=lambda x: x.get_area(), reverse=True)
     
-    # Compute packing layout using the new maximal-rectangles algorithm
-    placements = pack_rectangles(candidates, page_width_pt, page_height_pt, pad_pt)
+    # Compute packing layout using the new skyline packing algorithm
+    debug_mode = log_level == "DEBUG"
+    placements = skyline_pack(candidates, page_width_pt, page_height_pt, pad_pt, debug=debug_mode)
     if not placements:
         logger.error("Unable to pack any images on the page with the given dimensions.")
         sys.exit(1)
@@ -275,53 +359,24 @@ def main():
     try:
         c = canvas.Canvas(args.output_pdf, pagesize=(page_width_pt, page_height_pt))
         
-        # Draw a subtle background grid for visual reference (optional)
-        if args.debug:
-            c.setStrokeColorRGB(0.9, 0.9, 0.9)  # Light gray
-            c.setLineWidth(0.25)
-            grid_step = cm_to_points(1)  # 1cm grid
-            for x in range(0, int(page_width_pt), int(grid_step)):
-                c.line(x, 0, x, page_height_pt)
-            for y in range(0, int(page_height_pt), int(grid_step)):
-                c.line(0, y, page_width_pt, y)
-            c.setStrokeColorRGB(0, 0, 0)  # Back to black
-        
-        # Draw all placements
+        # Draw all placements with fixed rotation rendering
         for placement in placements:
-            # Save the canvas state before applying transformations
             c.saveState()
-            
-            # For rotations, get actual image dimensions (without padding)
-            if placement.rotation in [0, 180]:
-                image_width = placement.width - 2*pad_pt
-                image_height = placement.height - 2*pad_pt
-            else:  
-                # For 90/270 degree rotations
-                image_height = placement.width - 2*pad_pt
-                image_width = placement.height - 2*pad_pt
-            
-            # Apply padding to position (the actual image is inside the padded area)
-            draw_x = placement.x + pad_pt
-            draw_y = placement.y + pad_pt
-            
-            # Move to the position where we want to place the image
-            c.translate(draw_x, draw_y)
-            
-            # If there's rotation, rotate around the center of the image
-            if placement.rotation != 0:
-                c.translate(image_width/2, image_height/2)
-                c.rotate(placement.rotation)
-                c.translate(-image_width/2, -image_height/2)
-            
-            # Draw the image
+            image_w = placement.width - 2*pad_pt
+            image_h = placement.height - 2*pad_pt
             reader = ImageReader(placement.img)
-            c.drawImage(reader, 0, 0, width=image_width, height=image_height)
-            
-            # Draw cut line exactly at image edge
-            c.setLineWidth(0.5)
-            c.rect(0, 0, image_width, image_height, stroke=1, fill=0)
-            
-            # Restore the canvas state
+            if placement.rotation == 90:
+                # For 90° rotation, translate from bottom-left to top-left of image bounding box
+                c.translate(placement.x + pad_pt + image_w, placement.y + pad_pt)
+                c.rotate(90)
+                c.drawImage(reader, 0, 0, width=image_h, height=image_w)
+                c.setLineWidth(0.5)
+                c.rect(0, 0, image_h, image_w, stroke=1, fill=0)
+            else:
+                c.translate(placement.x + pad_pt, placement.y + pad_pt)
+                c.drawImage(reader, 0, 0, width=image_w, height=image_h)
+                c.setLineWidth(0.5)
+                c.rect(0, 0, image_w, image_h, stroke=1, fill=0)
             c.restoreState()
         
         # Add page information if in debug mode
